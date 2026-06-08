@@ -4,6 +4,10 @@ use crate::vietoris_rips::VRComplex;
 /// A boundary matrix for a chain complex C₂ → C₁ → C₀.
 ///
 /// Stored as a list of column vectors over Z₂ (hence `i32` values are 0 or 1).
+/// Boundary matrix for a chain complex C₂ → C₁ → C₀ over Z₂.
+///
+/// Stored column-major: `matrix[j]` is column j. Entry (i,j)=1 means
+/// simplex i is a face of simplex j.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BoundaryMatrix {
     /// Column-major: `matrix[j]` is column j of the boundary matrix.

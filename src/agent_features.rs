@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use crate::barcode::BarcodeCollection;
 
 /// Agent personality features extracted from persistence barcodes.
+///
+/// Three-dimensional personality vector: [stability, adaptability, depth].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentFeatures {
     /// Stability: proportion of long-lived H₀ bars (connected components that persist).

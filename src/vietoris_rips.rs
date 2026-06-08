@@ -2,6 +2,9 @@ use serde::{Deserialize, Serialize};
 use crate::point_cloud::PointCloud;
 
 /// A Vietoris-Rips simplicial complex built from a point cloud.
+///
+/// Each simplex is included when all pairwise distances ≤ ε.
+/// Filtration value = max pairwise distance in the simplex.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VRComplex {
     /// Each simplex is a sorted list of vertex indices.

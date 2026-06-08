@@ -3,6 +3,7 @@ use crate::vietoris_rips::VRComplex;
 use crate::barcode::Barcode;
 
 /// Result of the reduction algorithm: reduced matrix + birth-death pairs.
+/// Result of column reduction on the boundary matrix over Z₂.
 #[derive(Debug, Clone)]
 pub struct ReductionResult {
     pub reduced: Vec<Vec<i32>>,

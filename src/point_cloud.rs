@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 // ── Core types ──────────────────────────────────────────────────────────────
 
 /// A single agent action represented as a point in behavior space.
+///
+/// Each action has an agent ID, timestamp, and a feature vector defining its position.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActionPoint {
     pub agent_id: String,
@@ -22,6 +24,7 @@ impl ActionPoint {
 }
 
 /// Distance metric for comparing action points.
+/// Distance metric for comparing action points in behavior space.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Metric {
     Euclidean,
@@ -30,6 +33,8 @@ pub enum Metric {
 }
 
 /// A collection of action points forming a point cloud in behavior space.
+///
+/// Supports Euclidean, Cosine, and Manhattan distance metrics.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PointCloud {
     pub points: Vec<ActionPoint>,

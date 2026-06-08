@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 
 /// A persistence barcode for a single homology dimension.
+///
+/// Each bar (birth, death) represents a topological feature that appears
+/// at scale `birth` and disappears at scale `death`. death=∞ means persistent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Barcode {
     /// Homology dimension (0 = connected components, 1 = loops, 2 = voids).
@@ -54,6 +57,7 @@ impl Barcode {
 }
 
 /// A collection of barcodes across all homology dimensions.
+/// Collection of barcodes across all homology dimensions (H₀, H₁, H₂, ...).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BarcodeCollection {
     pub barcodes: Vec<Barcode>,
