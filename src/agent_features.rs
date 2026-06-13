@@ -1,126 +1,164 @@
 use serde::{Deserialize, Serialize};
-use crate::barcode::Barcode;
-use crate::point_cloud::PointCloud;
-use crate::vietoris_rips::VietorisRipsComplex;
+use crate::barcode::BarcodeCollection;
 
-/// Topological archetype of an agent's behavior pattern.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum AgentArchetype {
-    /// Single persistent cluster — stable, predictable behavior.
-    Steady,
-    /// Many short-lived loops — exploration-heavy, wandering.
-    Explorer,
-    /// Many disconnected components — volatile, switching between modes.
-    Volatile,
-    /// Long-lived higher-dimensional features — complex, structured behavior.
-    Deep,
-    /// Mix of features — no dominant topological signature.
-    Balanced,
-}
-
-impl std::fmt::Display for AgentArchetype {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            AgentArchetype::Steady => write!(f, "Steady"),
-            AgentArchetype::Explorer => write!(f, "Explorer"),
-            AgentArchetype::Volatile => write!(f, "Volatile"),
-            AgentArchetype::Deep => write!(f, "Deep"),
-            AgentArchetype::Balanced => write!(f, "Balanced"),
-        }
-    }
-}
-
-/// A topological profile of an agent's behavior.
+/// Agent personality features extracted from persistence barcodes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentProfile {
-    pub archetype: AgentArchetype,
-    pub persistence_entropy: f64,
-    pub max_persistence: f64,
-    pub betti_numbers: Vec<usize>,
+pub struct AgentFeatures {
+    /// Stability: proportion of long-lived H₀ bars (connected components that persist).
+    /// High stability → consistent, predictable agent behavior.
+    pub stability: f64,
+    /// Adaptability: density of short-lived H₁ bars (transient loops = behavioral flexibility).
+    /// High adaptability → agent explores many behavioral patterns.
+    pub adaptability: f64,
+    /// Depth: H₂ persistence (voids in behavior space = complex, multi-dimensional behavior).
+    /// High depth → rich, layered behavioral repertoire.
+    pub depth: f64,
+    /// Combined personality vector [stability, adaptability, depth].
+    pub personality_vector: Vec<f64>,
 }
 
-/// Profiler that maps topological features to agent behavior archetypes.
-pub struct AgentProfiler {
-    pub max_dimension: usize,
+impl AgentFeatures {
+    /// Extract agent features from a barcode collection.
+    pub fn from_barcodes(barcodes: &BarcodeCollection) -> Self {
+        let stability = Self::compute_stability(barcodes);
+        let adaptability = Self::compute_adaptability(barcodes);
+        let depth = Self::compute_depth(barcodes);
+        let personality_vector = vec![stability, adaptability, depth];
+        Self { stability, adaptability, depth, personality_vector }
+    }
+
+    /// Stability: ratio of infinite H₀ bars to total H₀ bars.
+    /// An agent with many persistent components has stable behavior.
+    fn compute_stability(barcodes: &BarcodeCollection) -> f64 {
+        if let Some(h0) = barcodes.dimension(0) {
+            if h0.bars.is_empty() {
+                return 0.0;
+            }
+            let infinite = h0.bars.iter().filter(|(_, d)| d.is_infinite()).count();
+            infinite as f64 / h0.bars.len() as f64
+        } else {
+            0.0
+        }
+    }
+
+    /// Adaptability: (number of short-lived H₁ bars) / (total bars + 1).
+    /// Short-lived loops indicate the agent cycles through behaviors quickly.
+    fn compute_adaptability(barcodes: &BarcodeCollection) -> f64 {
+        if let Some(h1) = barcodes.dimension(1) {
+            let total = h1.bars.len();
+            let short_lived = h1.bars.iter()
+                .filter(|(b, d)| d.is_finite() && (d - b) < h1.mean_persistence())
+                .count();
+            short_lived as f64 / (total + 1) as f64
+        } else {
+            0.0
+        }
+    }
+
+    /// Depth: total H₂ persistence (sum of void bar lengths).
+    /// Voids in behavior space represent complex multi-dimensional patterns.
+    fn compute_depth(barcodes: &BarcodeCollection) -> f64 {
+        if let Some(h2) = barcodes.dimension(2) {
+            h2.total_persistence()
+        } else {
+            0.0
+        }
+    }
+
+    /// Classify the agent's behavioral archetype based on features.
+    pub fn archetype(&self) -> &'static str {
+        if self.stability > 0.7 && self.adaptability < 0.3 {
+            "Steady"
+        } else if self.adaptability > 0.5 && self.depth > 0.5 {
+            "Explorer"
+        } else if self.depth > 0.7 {
+            "Deep"
+        } else if self.stability > 0.5 && self.adaptability > 0.3 {
+            "Balanced"
+        } else {
+            "Volatile"
+        }
+    }
 }
 
-impl AgentProfiler {
-    pub fn new(max_dimension: usize) -> Self {
-        Self { max_dimension }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::barcode::Barcode;
+
+    #[test]
+    fn test_features_stable_agent() {
+        let barcodes = BarcodeCollection::new(vec![
+            Barcode { dimension: 0, bars: vec![(0.0, f64::INFINITY), (0.0, f64::INFINITY)] },
+            Barcode { dimension: 1, bars: vec![] },
+        ]);
+        let features = AgentFeatures::from_barcodes(&barcodes);
+        assert!((features.stability - 1.0).abs() < 1e-9);
+        assert_eq!(features.archetype(), "Steady");
     }
 
-    /// Profile an agent from its state-space trajectory (sequence of observation vectors).
-    pub fn profile(&self, observations: Vec<Vec<f64>>) -> Result<AgentProfile, crate::error::PersistenceError> {
-        let cloud = PointCloud::new(observations)?;
-        let max_eps = cloud.max_distance();
-        let vr = VietorisRipsComplex::build(&cloud, self.max_dimension, max_eps)?;
-        let barcode = Barcode::compute(&vr)?;
-
-        let entropy = barcode.persistence_entropy();
-        let max_pers = barcode.max_persistence();
-        let betti = barcode.betti_numbers_at(max_eps / 2.0);
-
-        let archetype = self.classify(&barcode, &betti, cloud.n_points());
-
-        Ok(AgentProfile {
-            archetype,
-            persistence_entropy: entropy,
-            max_persistence: max_pers,
-            betti_numbers: betti,
-        })
+    #[test]
+    fn test_features_adaptable_agent() {
+        let barcodes = BarcodeCollection::new(vec![
+            Barcode { dimension: 0, bars: vec![(0.0, f64::INFINITY)] },
+            Barcode {
+                dimension: 1,
+                bars: vec![
+                    (0.1, 0.2), (0.3, 0.4), (0.5, 0.6), (0.7, 0.8),
+                    (1.0, 2.0), (1.5, 2.5),
+                ],
+            },
+            Barcode { dimension: 2, bars: vec![(0.5, 1.5), (1.0, 2.0)] },
+        ]);
+        let features = AgentFeatures::from_barcodes(&barcodes);
+        assert!(features.adaptability > 0.0);
+        assert!(features.depth > 0.0);
+        assert_eq!(features.personality_vector.len(), 3);
     }
 
-    fn classify(
-        &self,
-        barcode: &Barcode,
-        _betti: &[usize],
-        n_points: usize,
-    ) -> AgentArchetype {
-        let h0_pairs: Vec<_> = barcode.pairs_of_dimension(0);
-        let h1_pairs: Vec<_> = barcode.pairs_of_dimension(1);
+    #[test]
+    fn test_features_empty_barcodes() {
+        let barcodes = BarcodeCollection::new(vec![]);
+        let features = AgentFeatures::from_barcodes(&barcodes);
+        assert!((features.stability - 0.0).abs() < 1e-9);
+        assert!((features.adaptability - 0.0).abs() < 1e-9);
+        assert!((features.depth - 0.0).abs() < 1e-9);
+    }
 
-        let n_components = h0_pairs.len();
-        // Long-lived H0 features (persistence > half of max)
-        let max_pers = barcode.max_persistence();
-        let long_h0 = h0_pairs
-            .iter()
-            .filter(|p| p.death.is_finite() && p.persistence() > max_pers * 0.5)
-            .count();
+    #[test]
+    fn test_archetype_balanced() {
+        let features = AgentFeatures {
+            stability: 0.6,
+            adaptability: 0.4,
+            depth: 0.2,
+            personality_vector: vec![0.6, 0.4, 0.2],
+        };
+        assert_eq!(features.archetype(), "Balanced");
+    }
 
-        // Short-lived H1 features (persistence < 0.3 * max)
-        let short_h1 = h1_pairs
-            .iter()
-            .filter(|p| p.death.is_finite() && p.persistence() < max_pers * 0.3)
-            .count();
+    #[test]
+    fn test_archetype_volatile() {
+        let features = AgentFeatures {
+            stability: 0.1,
+            adaptability: 0.1,
+            depth: 0.1,
+            personality_vector: vec![0.1, 0.1, 0.1],
+        };
+        assert_eq!(features.archetype(), "Volatile");
+    }
 
-        // Long-lived H1+ features
-        let higher_dim_count: usize = barcode
-            .pairs
-            .iter()
-            .filter(|p| p.dimension >= 1 && p.death.is_finite() && p.persistence() > max_pers * 0.4)
-            .count();
-
-        // Many disconnected components relative to point count → Volatile
-        let component_ratio = n_components as f64 / n_points.max(1) as f64;
-        if component_ratio > 0.5 && long_h0 <= 1 {
-            return AgentArchetype::Volatile;
-        }
-
-        // Single persistent cluster (1 long H0, few other features)
-        if long_h0 == 1 && h1_pairs.len() <= 1 && higher_dim_count == 0 {
-            return AgentArchetype::Steady;
-        }
-
-        // Many short-lived loops
-        if short_h1 >= 3 || (h1_pairs.len() as f64 / n_points.max(1) as f64 > 0.3 && short_h1 >= 1) {
-            return AgentArchetype::Explorer;
-        }
-
-        // Long-lived higher-dimensional features
-        if higher_dim_count >= 1 {
-            return AgentArchetype::Deep;
-        }
-
-        AgentArchetype::Balanced
+    #[test]
+    fn test_serde_roundtrip_agent_features() {
+        let features = AgentFeatures {
+            stability: 0.75,
+            adaptability: 0.5,
+            depth: 0.3,
+            personality_vector: vec![0.75, 0.5, 0.3],
+        };
+        let json = serde_json::to_string(&features).unwrap();
+        let decoded: AgentFeatures = serde_json::from_str(&json).unwrap();
+        assert!((decoded.stability - features.stability).abs() < 1e-9);
+        assert!((decoded.adaptability - features.adaptability).abs() < 1e-9);
+        assert_eq!(decoded.personality_vector, features.personality_vector);
     }
 }

@@ -1,105 +1,217 @@
-use crate::error::PersistenceError;
+use serde::{Deserialize, Serialize};
 
-/// A set of points in Euclidean space with a precomputed distance matrix.
-#[derive(Debug, Clone)]
+// ── Core types ──────────────────────────────────────────────────────────────
+
+/// A single agent action represented as a point in behavior space.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionPoint {
+    pub agent_id: String,
+    pub timestamp: f64,
+    pub features: Vec<f64>,
+}
+
+impl ActionPoint {
+    pub fn new(agent_id: impl Into<String>, timestamp: f64, features: Vec<f64>) -> Self {
+        Self { agent_id: agent_id.into(), timestamp, features }
+    }
+
+    /// L2 norm of the feature vector.
+    pub fn norm(&self) -> f64 {
+        self.features.iter().map(|x| x * x).sum::<f64>().sqrt()
+    }
+}
+
+/// Distance metric for comparing action points.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Metric {
+    Euclidean,
+    Cosine,
+    Manhattan,
+}
+
+/// A collection of action points forming a point cloud in behavior space.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PointCloud {
-    pub points: Vec<Vec<f64>>,
-    pub distance_matrix: Vec<Vec<f64>>,
+    pub points: Vec<ActionPoint>,
+    pub metric: Metric,
 }
 
 impl PointCloud {
-    /// Build a point cloud, computing the pairwise Euclidean distance matrix.
-    pub fn new(points: Vec<Vec<f64>>) -> Result<Self, PersistenceError> {
-        if points.is_empty() {
-            return Err(PersistenceError::EmptyCloud);
-        }
-        let dim = points[0].len();
-        for p in points.iter() {
-            if p.len() != dim {
-                return Err(PersistenceError::DimensionMismatch {
-                    expected: dim,
-                    actual: p.len(),
-                });
+    pub fn new(points: Vec<ActionPoint>, metric: Metric) -> Self {
+        Self { points, metric }
+    }
+
+    /// Compute the distance between two points using the configured metric.
+    pub fn distance(&self, i: usize, j: usize) -> f64 {
+        let a = &self.points[i].features;
+        let b = &self.points[j].features;
+        match self.metric {
+            Metric::Euclidean => {
+                a.iter().zip(b.iter()).map(|(x, y)| (x - y).powi(2)).sum::<f64>().sqrt()
+            }
+            Metric::Cosine => {
+                let dot: f64 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+                let norm_a: f64 = a.iter().map(|x| x * x).sum::<f64>().sqrt();
+                let norm_b: f64 = b.iter().map(|x| x * x).sum::<f64>().sqrt();
+                if norm_a == 0.0 || norm_b == 0.0 {
+                    return 1.0; // max cosine distance for zero vectors
+                }
+                1.0 - dot / (norm_a * norm_b)
+            }
+            Metric::Manhattan => {
+                a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).sum()
             }
         }
-        let n = points.len();
+    }
+
+    /// Compute the full pairwise distance matrix.
+    pub fn distance_matrix(&self) -> Vec<Vec<f64>> {
+        let n = self.points.len();
         let mut dm = vec![vec![0.0; n]; n];
         for i in 0..n {
             for j in (i + 1)..n {
-                let d = euclidean(&points[i], &points[j]);
+                let d = self.distance(i, j);
                 dm[i][j] = d;
                 dm[j][i] = d;
             }
         }
-        Ok(Self {
-            points,
-            distance_matrix: dm,
-        })
+        dm
     }
 
-    pub fn n_points(&self) -> usize {
-        self.points.len()
+    /// Find the k nearest neighbors of point `i` (excluding the point itself).
+    pub fn knn(&self, i: usize, k: usize) -> Vec<(usize, f64)> {
+        let n = self.points.len();
+        let mut dists: Vec<(usize, f64)> = (0..n)
+            .filter(|&j| j != i)
+            .map(|j| (j, self.distance(i, j)))
+            .collect();
+        dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        dists.truncate(k);
+        dists
     }
 
-    pub fn dimension(&self) -> usize {
-        self.points[0].len()
-    }
-
-    /// Distance between points at indices `i` and `j`.
-    pub fn distance(&self, i: usize, j: usize) -> f64 {
-        self.distance_matrix[i][j]
-    }
-
-    /// k-nearest-neighbor graph: returns for each point the indices of its k nearest
-    /// neighbors (excluding itself), sorted by distance ascending.
-    pub fn knn(&self, k: usize) -> Result<Vec<Vec<usize>>, PersistenceError> {
-        let n = self.n_points();
-        if k == 0 || k >= n {
-            return Err(PersistenceError::InvalidK { k, n });
-        }
-        let mut result = Vec::with_capacity(n);
-        for i in 0..n {
-            let mut pairs: Vec<(f64, usize)> = (0..n)
-                .filter(|&j| j != i)
-                .map(|j| (self.distance_matrix[i][j], j))
-                .collect();
-            pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-            result.push(pairs[..k].iter().map(|(_, j)| *j).collect());
-        }
-        Ok(result)
-    }
-
-    /// Maximum pairwise distance in the cloud.
-    pub fn max_distance(&self) -> f64 {
-        let n = self.n_points();
-        let mut mx: f64 = 0.0;
-        for i in 0..n {
-            for j in (i + 1)..n {
-                mx = mx.max(self.distance_matrix[i][j]);
-            }
-        }
-        mx
-    }
-
-    /// Return the sorted list of unique pairwise distances (filtration thresholds).
-    pub fn unique_distances(&self) -> Vec<f64> {
-        let n = self.n_points();
+    /// Get all unique pairwise distances, sorted ascending.
+    pub fn sorted_distances(&self) -> Vec<f64> {
+        let n = self.points.len();
         let mut dists = Vec::new();
         for i in 0..n {
             for j in (i + 1)..n {
-                dists.push(self.distance_matrix[i][j]);
+                dists.push(self.distance(i, j));
             }
         }
         dists.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        dists.dedup_by(|a, b| (*a - *b).abs() < 1e-12);
         dists
     }
 }
 
-fn euclidean(a: &[f64], b: &[f64]) -> f64 {
-    a.iter()
-        .zip(b.iter())
-        .map(|(x, y)| (x - y) * (x - y))
-        .sum::<f64>()
-        .sqrt()
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_euclidean_distance() {
+        let pc = PointCloud::new(
+            vec![
+                ActionPoint::new("a", 0.0, vec![0.0, 0.0]),
+                ActionPoint::new("b", 1.0, vec![3.0, 4.0]),
+            ],
+            Metric::Euclidean,
+        );
+        let d = pc.distance(0, 1);
+        assert!((d - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_cosine_distance_identical() {
+        let pc = PointCloud::new(
+            vec![
+                ActionPoint::new("a", 0.0, vec![1.0, 2.0, 3.0]),
+                ActionPoint::new("b", 1.0, vec![2.0, 4.0, 6.0]),
+            ],
+            Metric::Cosine,
+        );
+        let d = pc.distance(0, 1);
+        assert!(d.abs() < 1e-9); // same direction → distance 0
+    }
+
+    #[test]
+    fn test_cosine_distance_orthogonal() {
+        let pc = PointCloud::new(
+            vec![
+                ActionPoint::new("a", 0.0, vec![1.0, 0.0]),
+                ActionPoint::new("b", 1.0, vec![0.0, 1.0]),
+            ],
+            Metric::Cosine,
+        );
+        let d = pc.distance(0, 1);
+        assert!((d - 1.0).abs() < 1e-9); // orthogonal → distance 1
+    }
+
+    #[test]
+    fn test_manhattan_distance() {
+        let pc = PointCloud::new(
+            vec![
+                ActionPoint::new("a", 0.0, vec![1.0, 2.0]),
+                ActionPoint::new("b", 1.0, vec![4.0, 6.0]),
+            ],
+            Metric::Manhattan,
+        );
+        let d = pc.distance(0, 1);
+        assert!((d - 7.0).abs() < 1e-9); // |3| + |4| = 7
+    }
+
+    #[test]
+    fn test_distance_matrix_symmetry() {
+        let pc = PointCloud::new(
+            vec![
+                ActionPoint::new("a", 0.0, vec![0.0]),
+                ActionPoint::new("b", 1.0, vec![1.0]),
+                ActionPoint::new("c", 2.0, vec![3.0]),
+            ],
+            Metric::Euclidean,
+        );
+        let dm = pc.distance_matrix();
+        for i in 0..3 {
+            for j in 0..3 {
+                assert!((dm[i][j] - dm[j][i]).abs() < 1e-9);
+            }
+        }
+    }
+
+    #[test]
+    fn test_knn_basic() {
+        let pc = PointCloud::new(
+            vec![
+                ActionPoint::new("a", 0.0, vec![0.0]),
+                ActionPoint::new("b", 1.0, vec![1.0]),
+                ActionPoint::new("c", 2.0, vec![5.0]),
+                ActionPoint::new("d", 3.0, vec![10.0]),
+            ],
+            Metric::Euclidean,
+        );
+        let nn = pc.knn(0, 2);
+        assert_eq!(nn.len(), 2);
+        assert_eq!(nn[0].0, 1); // closest to 0 is 1
+        assert!((nn[0].1 - 1.0).abs() < 1e-9);
+        assert_eq!(nn[1].0, 2); // second closest is 2
+        assert!((nn[1].1 - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_sorted_distances() {
+        let pc = PointCloud::new(
+            vec![
+                ActionPoint::new("a", 0.0, vec![0.0]),
+                ActionPoint::new("b", 1.0, vec![2.0]),
+                ActionPoint::new("c", 2.0, vec![5.0]),
+            ],
+            Metric::Euclidean,
+        );
+        let d = pc.sorted_distances();
+        // Distances: (0,1)=2, (1,2)=3, (0,2)=5 → sorted: [2, 3, 5]
+        assert_eq!(d.len(), 3);
+        assert!((d[0] - 2.0).abs() < 1e-9);
+        assert!((d[1] - 3.0).abs() < 1e-9);
+        assert!((d[2] - 5.0).abs() < 1e-9);
+    }
 }

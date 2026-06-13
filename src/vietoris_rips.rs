@@ -1,127 +1,270 @@
-use crate::error::PersistenceError;
+use serde::{Deserialize, Serialize};
 use crate::point_cloud::PointCloud;
 
-/// A Vietoris-Rips complex built from a point cloud.
-/// Simplices are added as epsilon grows — a k-simplex [v0,…,vk] appears at the
-/// maximum pairwise distance among its vertices.
-#[derive(Debug, Clone)]
-pub struct VietorisRipsComplex {
+/// A Vietoris-Rips simplicial complex built from a point cloud.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VRComplex {
+    /// Each simplex is a sorted list of vertex indices.
     pub simplices: Vec<Vec<usize>>,
+    /// Filtration value at which each simplex first appears.
     pub filtration_values: Vec<f64>,
-    pub max_dimension: usize,
 }
 
-impl VietorisRipsComplex {
-    /// Build the Vietoris-Rips complex up to `max_dimension`.
-    /// For large point clouds you can pass `max_eps` to prune simplices whose
-    /// filtration value exceeds it; pass `f64::INFINITY` to include everything.
-    pub fn build(
-        cloud: &PointCloud,
-        max_dimension: usize,
-        max_eps: f64,
-    ) -> Result<Self, PersistenceError> {
-        let n = cloud.n_points();
-        if n == 0 {
-            return Err(PersistenceError::EmptyCloud);
-        }
+impl VRComplex {
+    /// Build the Vietoris-Rips complex up to max_dim simplices.
+    ///
+    /// A simplex σ is included when all pairwise distances among its vertices
+    /// are ≤ ε, and the filtration value is the maximum such pairwise distance.
+    pub fn build(cloud: &PointCloud, eps: f64, max_dim: usize) -> Self {
+        let n = cloud.points.len();
+        let dm = cloud.distance_matrix();
+        let mut simplices = Vec::new();
+        let mut filt_vals = Vec::new();
 
-        let mut simplices: Vec<Vec<usize>> = Vec::new();
-        let mut filtration_values: Vec<f64> = Vec::new();
-
-        // Dimension 0: each vertex appears at epsilon = 0
+        // Vertices always present at filtration 0
         for i in 0..n {
             simplices.push(vec![i]);
-            filtration_values.push(0.0);
+            filt_vals.push(0.0);
         }
 
         // Iteratively build higher-dimensional simplices
+        // Start with edges (dim 1)
         let mut current_simplices: Vec<Vec<usize>> = (0..n).map(|i| vec![i]).collect();
 
-        for _dim in 0..max_dimension {
-            let mut candidates: Vec<(f64, Vec<usize>)> = Vec::new();
-            for simplex in &current_simplices {
-                // Try to extend by adding any vertex with index > max(simplex)
-                let max_v = *simplex.iter().max().unwrap();
-                for v in (max_v + 1)..n {
-                    let mut new_simplex = simplex.clone();
-                    new_simplex.push(v);
-                    new_simplex.sort();
+        for dim in 1..=max_dim {
+            let mut next_simplices = Vec::new();
+            let candidates = if dim == 1 {
+                // Edges: all pairs
+                let mut edges = Vec::new();
+                for i in 0..n {
+                    for j in (i + 1)..n {
+                        edges.push(vec![i, j]);
+                    }
+                }
+                edges
+            } else {
+                // Higher simplices: build from lower simplices
+                Self::build_higher_simplices(&current_simplices, dim)
+            };
 
-                    // Filtration value = max pairwise distance
-                    let filt = max_pairwise(cloud, &new_simplex);
-                    if filt <= max_eps {
-                        candidates.push((filt, new_simplex));
+            for sigma in candidates {
+                // Check if max pairwise distance ≤ eps
+                let max_d = Self::max_pairwise_distance(&sigma, &dm);
+                if max_d <= eps + 1e-12 {
+                    let mut sorted_sigma = sigma.clone();
+                    sorted_sigma.sort();
+                    // Avoid duplicates
+                    if !simplices.contains(&sorted_sigma) {
+                        simplices.push(sorted_sigma.clone());
+                        filt_vals.push(max_d);
+                        next_simplices.push(sorted_sigma);
                     }
                 }
             }
 
-            // Sort by filtration value, break ties by lexicographic order
-            candidates.sort_by(|a, b| {
-                a.0.partial_cmp(&b.0)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| a.1.cmp(&b.1))
-            });
-
-            current_simplices = candidates.iter().map(|(_, s)| s.clone()).collect();
-            for (filt, s) in &candidates {
-                simplices.push(s.clone());
-                filtration_values.push(*filt);
-            }
-
+            current_simplices = next_simplices;
             if current_simplices.is_empty() {
                 break;
             }
         }
 
-        Ok(Self {
-            simplices,
-            filtration_values,
-            max_dimension,
-        })
-    }
-
-    pub fn n_simplices(&self) -> usize {
-        self.simplices.len()
-    }
-
-    /// Return the dimension of a simplex at given index.
-    pub fn simplex_dimension(&self, idx: usize) -> usize {
-        self.simplices[idx].len().saturating_sub(1)
-    }
-
-    /// Indices of all simplices of a given dimension.
-    pub fn simplices_of_dimension(&self, dim: usize) -> Vec<usize> {
-        self.simplices
-            .iter()
-            .enumerate()
-            .filter(|(_, s)| s.len().saturating_sub(1) == dim)
-            .map(|(i, _)| i)
-            .collect()
-    }
-
-    /// All (dimension, simplex-index) pairs sorted by filtration value then dimension.
-    pub fn sorted_filtration(&self) -> Vec<(usize, usize)> {
-        let mut indexed: Vec<(usize, usize, f64)> = self
-            .simplices
-            .iter()
-            .enumerate()
-            .map(|(i, s)| (s.len().saturating_sub(1), i, self.filtration_values[i]))
-            .collect();
-        indexed.sort_by(|a, b| {
-            a.2.partial_cmp(&b.2)
+        // Sort by filtration value, then by simplex size, then lexicographically
+        let mut combined: Vec<_> = simplices.into_iter().zip(filt_vals.into_iter()).collect();
+        combined.sort_by(|a, b| {
+            a.1.partial_cmp(&b.1)
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.len().cmp(&b.0.len()))
                 .then_with(|| a.0.cmp(&b.0))
         });
-        indexed.into_iter().map(|(d, i, _)| (d, i)).collect()
+
+        let (simplices, filtration_values) = combined.into_iter().unzip();
+        Self { simplices, filtration_values }
+    }
+
+    /// Build the full filtration: insert simplices at all unique epsilon values.
+    pub fn build_filtration(cloud: &PointCloud, max_dim: usize) -> Self {
+        let n = cloud.points.len();
+        let dm = cloud.distance_matrix();
+        let mut simplices: Vec<Vec<usize>> = Vec::new();
+        let mut filt_vals: Vec<f64> = Vec::new();
+
+        // Vertices
+        for i in 0..n {
+            simplices.push(vec![i]);
+            filt_vals.push(0.0);
+        }
+
+        // Edges
+        for i in 0..n {
+            for j in (i + 1)..n {
+                simplices.push(vec![i, j]);
+                filt_vals.push(dm[i][j]);
+            }
+        }
+
+        // Higher simplices (dim >= 2)
+        if max_dim >= 2 {
+            let edges: Vec<Vec<usize>> = simplices.iter().filter(|s| s.len() == 2).cloned().collect();
+            let _vertices: Vec<Vec<usize>> = simplices.iter().filter(|s| s.len() == 1).cloned().collect();
+            let mut prev_dim_simplices: Vec<Vec<usize>> = edges;
+
+            for dim in 2..=max_dim {
+                let candidates = Self::build_higher_simplices(&prev_dim_simplices, dim);
+                let mut next_simplices = Vec::new();
+
+                for sigma in candidates {
+                    let mut sorted = sigma;
+                    sorted.sort();
+                    if simplices.contains(&sorted) {
+                        continue;
+                    }
+                    let max_d = Self::max_pairwise_distance(&sorted, &dm);
+                    simplices.push(sorted.clone());
+                    filt_vals.push(max_d);
+                    next_simplices.push(sorted);
+                }
+                prev_dim_simplices = next_simplices;
+                if prev_dim_simplices.is_empty() {
+                    break;
+                }
+            }
+        }
+
+        // Sort
+        let mut combined: Vec<_> = simplices.into_iter().zip(filt_vals.into_iter()).collect();
+        combined.sort_by(|a, b| {
+            a.1.partial_cmp(&b.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.len().cmp(&b.0.len()))
+                .then_with(|| a.0.cmp(&b.0))
+        });
+
+        let (simplices, filtration_values) = combined.into_iter().unzip();
+        Self { simplices, filtration_values }
+    }
+
+    fn build_higher_simplices(prev_simplices: &[Vec<usize>], dim: usize) -> Vec<Vec<usize>> {
+        let mut result = Vec::new();
+        let n = prev_simplices.len();
+        for i in 0..n {
+            for j in (i + 1)..n {
+                // Two (dim)-simplices can form a (dim+1)-simplex if they share (dim) vertices
+                let a = &prev_simplices[i];
+                let b = &prev_simplices[j];
+                if a.len() != dim || b.len() != dim {
+                    continue;
+                }
+                // Check that they share (dim - 1) vertices and differ in exactly 1
+                let shared: Vec<usize> = a.iter().filter(|x| b.contains(x)).copied().collect();
+                if shared.len() == dim - 1 {
+                    let mut merged: Vec<usize> = a.clone();
+                    for &x in b {
+                        if !merged.contains(&x) {
+                            merged.push(x);
+                        }
+                    }
+                    merged.sort();
+                    if merged.len() == dim + 1 && !result.contains(&merged) {
+                        result.push(merged);
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    fn max_pairwise_distance(simplex: &[usize], dm: &[Vec<f64>]) -> f64 {
+        let mut max_d: f64 = 0.0;
+        for i in 0..simplex.len() {
+            for j in (i + 1)..simplex.len() {
+                max_d = max_d.max(dm[simplex[i]][simplex[j]]);
+            }
+        }
+        max_d
+    }
+
+    /// Get simplices of a specific dimension.
+    pub fn simplices_of_dim(&self, dim: usize) -> Vec<(Vec<usize>, f64)> {
+        self.simplices
+            .iter()
+            .zip(self.filtration_values.iter())
+            .filter(|(s, _)| s.len() == dim + 1)
+            .map(|(s, f)| (s.clone(), *f))
+            .collect()
     }
 }
 
-fn max_pairwise(cloud: &PointCloud, simplex: &[usize]) -> f64 {
-    let mut mx = 0.0_f64;
-    for i in 0..simplex.len() {
-        for j in (i + 1)..simplex.len() {
-            mx = mx.max(cloud.distance(simplex[i], simplex[j]));
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::point_cloud::{ActionPoint, Metric, PointCloud};
+
+    #[test]
+    fn test_vr_eps_zero_vertices_only() {
+        let pc = PointCloud::new(
+            vec![
+                ActionPoint::new("a", 0.0, vec![0.0]),
+                ActionPoint::new("b", 1.0, vec![1.0]),
+                ActionPoint::new("c", 2.0, vec![3.0]),
+            ],
+            Metric::Euclidean,
+        );
+        let vr = VRComplex::build(&pc, 0.0, 2);
+        assert_eq!(vr.simplices.len(), 3);
+        assert!(vr.simplices.iter().all(|s| s.len() == 1));
     }
-    mx
+
+    #[test]
+    fn test_vr_large_eps_fully_connected() {
+        let pc = PointCloud::new(
+            vec![
+                ActionPoint::new("a", 0.0, vec![0.0]),
+                ActionPoint::new("b", 1.0, vec![1.0]),
+                ActionPoint::new("c", 2.0, vec![2.0]),
+            ],
+            Metric::Euclidean,
+        );
+        let vr = VRComplex::build(&pc, 100.0, 2);
+        // 3 vertices + 3 edges + 1 triangle = 7
+        assert_eq!(vr.simplices.len(), 7);
+        assert!(vr.simplices.iter().any(|s| s.len() == 3));
+    }
+
+    #[test]
+    fn test_vr_filtration_triangle() {
+        let pc = PointCloud::new(
+            vec![
+                ActionPoint::new("a", 0.0, vec![0.0]),
+                ActionPoint::new("b", 1.0, vec![1.0]),
+                ActionPoint::new("c", 2.0, vec![3.0]),
+            ],
+            Metric::Euclidean,
+        );
+        let vr = VRComplex::build_filtration(&pc, 2);
+        // Should have 3 vertices + 3 edges + 1 triangle = 7
+        assert_eq!(vr.simplices.len(), 7);
+        let triangle_fv = vr.simplices.iter().zip(vr.filtration_values.iter())
+            .find(|(s, _)| s.len() == 3)
+            .map(|(_, f)| *f)
+            .unwrap();
+        // Max pairwise distance in triangle: d(0,2) = 3.0
+        assert!((triangle_fv - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_vr_partial_eps() {
+        let pc = PointCloud::new(
+            vec![
+                ActionPoint::new("a", 0.0, vec![0.0]),
+                ActionPoint::new("b", 1.0, vec![1.0]),
+                ActionPoint::new("c", 2.0, vec![10.0]),
+            ],
+            Metric::Euclidean,
+        );
+        // eps = 5: should connect a-b but not c
+        let vr = VRComplex::build(&pc, 5.0, 2);
+        // 3 vertices + 1 edge = 4
+        assert_eq!(vr.simplices.len(), 4);
+        assert_eq!(vr.simplices.iter().filter(|s| s.len() == 2).count(), 1);
+    }
 }

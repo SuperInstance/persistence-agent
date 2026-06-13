@@ -1,97 +1,152 @@
-use crate::error::PersistenceError;
-use crate::vietoris_rips::VietorisRipsComplex;
+use serde::{Deserialize, Serialize};
+use crate::vietoris_rips::VRComplex;
 
-/// Boundary matrix over Z/2Z with column reduction for persistence computation.
-#[derive(Debug, Clone)]
+/// A boundary matrix for a chain complex C₂ → C₁ → C₀.
+///
+/// Stored as a list of column vectors over Z₂ (hence `i32` values are 0 or 1).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BoundaryMatrix {
-    pub matrix: Vec<Vec<u8>>,
-    pub n_simplices: usize,
+    /// Column-major: `matrix[j]` is column j of the boundary matrix.
+    pub matrix: Vec<Vec<i32>>,
+    /// Dimension of the simplicial complex used to build this.
+    pub dim: usize,
+    /// Number of columns (one per simplex).
+    pub n_cols: usize,
+    /// Number of rows (one per simplex in the boundary).
+    pub n_rows: usize,
 }
 
 impl BoundaryMatrix {
-    /// Build the mod-2 boundary matrix from a Vietoris-Rips complex.
+    /// Build the full boundary matrix from a VR complex.
     ///
-    /// The columns are indexed by simplices (in the same order as `vr.simplices`),
-    /// and rows are indexed by the *simplices one dimension lower*.
-    ///
-    /// We use a dense representation for clarity: `matrix[col][row]` ∈ {0, 1}.
-    /// For each column (a k-simplex), the rows with value 1 correspond to the
-    /// (k−1)-faces of that simplex.
-    pub fn build(vr: &VietorisRipsComplex) -> Result<Self, PersistenceError> {
-        let n = vr.n_simplices();
-        if n == 0 {
-            return Err(PersistenceError::EmptyFiltration);
-        }
+    /// Columns are indexed by simplex index (in the order given by VRComplex),
+    /// and rows are indexed by simplex index as well. An entry `matrix[j][i] = 1`
+    /// means simplex i is a face of simplex j.
+    pub fn from_vr_complex(complex: &VRComplex) -> Self {
+        let n = complex.simplices.len();
+        let mut matrix = vec![vec![0i32; n]; n];
 
-        // Map each simplex to its index for fast face lookup
-        let mut simplex_index = std::collections::HashMap::new();
-        for (i, s) in vr.simplices.iter().enumerate() {
-            simplex_index.insert(s.clone(), i);
-        }
-
-        let mut matrix = vec![vec![0u8; n]; n];
-
-        for (col_idx, simplex) in vr.simplices.iter().enumerate() {
-            if simplex.len() <= 1 {
-                // Vertices have no boundary
+        for (j, sigma) in complex.simplices.iter().enumerate() {
+            if sigma.len() <= 1 {
+                // Vertices have empty boundary
                 continue;
             }
-            // All (k−1)-faces: remove one vertex at a time
-            for skip in 0..simplex.len() {
-                let face: Vec<usize> = simplex
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, _)| *i != skip)
+            // Boundary of σ is all (dim-1)-faces: remove one vertex at a time
+            for skip in 0..sigma.len() {
+                let face: Vec<usize> = sigma.iter().enumerate()
+                    .filter(|(k, _)| *k != skip)
                     .map(|(_, &v)| v)
                     .collect();
-                if let Some(&row_idx) = simplex_index.get(&face) {
-                    matrix[col_idx][row_idx] ^= 1;
+                // Find the index of this face in the complex
+                if let Some(i) = complex.simplices.iter().position(|s| *s == face) {
+                    matrix[j][i] = 1;
                 }
             }
         }
 
-        Ok(Self {
-            matrix,
-            n_simplices: n,
-        })
+        let dim = complex.simplices.iter().map(|s| s.len()).max().unwrap_or(1).saturating_sub(1);
+        BoundaryMatrix { matrix, dim, n_cols: n, n_rows: n }
     }
 
-    /// Reduce the matrix using the standard algorithm.
-    /// After reduction, column `j` is either zero or its lowest nonzero row `low(j)`
-    /// is unique. Returns a mapping `low -> j` for non-zero reduced columns.
-    pub fn reduce(&mut self) -> std::collections::HashMap<usize, usize> {
-        let n = self.n_simplices;
-        let mut low_to_col: std::collections::HashMap<usize, usize> =
-            std::collections::HashMap::new();
-
-        for j in 0..n {
-            while let Some(lj) = self.low(j) {
-                if let Some(&k) = low_to_col.get(&lj) {
-                    self.add_columns(k, j);
-                } else {
-                    low_to_col.insert(lj, j);
-                    break;
+    /// Verify ∂² = 0: the boundary of a boundary is zero.
+    /// Returns true if ∂² = 0 holds over Z₂.
+    pub fn verify_boundary_squared_zero(&self) -> bool {
+        // Compute self * self over Z₂
+        for i in 0..self.n_rows {
+            for j in 0..self.n_cols {
+                let mut sum = 0i32;
+                for k in 0..self.n_cols {
+                    sum += self.matrix[k][i] * self.matrix[j][k];
+                }
+                if sum % 2 != 0 {
+                    return false;
                 }
             }
         }
-
-        low_to_col
+        true
     }
 
-    /// Lowest nonzero row in column `j`, or None if the column is zero.
+    /// Get the lowest nonzero row index in column j (returns None if column is zero).
     pub fn low(&self, j: usize) -> Option<usize> {
-        self.matrix[j]
-            .iter()
-            .enumerate()
-            .rev()
-            .find(|(_, &v)| v == 1)
+        self.matrix[j].iter().enumerate().rev()
+            .find(|(_, v)| **v != 0)
             .map(|(i, _)| i)
     }
 
-    /// Add column `src` to column `dst` (mod 2).
-    fn add_columns(&mut self, src: usize, dst: usize) {
-        for i in 0..self.n_simplices {
-            self.matrix[dst][i] ^= self.matrix[src][i];
-        }
+    /// Get the dimension of simplex at index i.
+    pub fn simplex_dim(&self, complex: &VRComplex, i: usize) -> usize {
+        complex.simplices[i].len().saturating_sub(1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::point_cloud::{ActionPoint, Metric, PointCloud};
+    use crate::vietoris_rips::VRComplex;
+
+    #[test]
+    fn test_boundary_squared_zero_triangle() {
+        let pc = PointCloud::new(
+            vec![
+                ActionPoint::new("a", 0.0, vec![0.0]),
+                ActionPoint::new("b", 1.0, vec![1.0]),
+                ActionPoint::new("c", 2.0, vec![2.0]),
+            ],
+            Metric::Euclidean,
+        );
+        let vr = VRComplex::build_filtration(&pc, 2);
+        let bm = BoundaryMatrix::from_vr_complex(&vr);
+        assert!(bm.verify_boundary_squared_zero());
+    }
+
+    #[test]
+    fn test_boundary_squared_zero_complex() {
+        // Four points in a tetrahedron-like arrangement
+        let pc = PointCloud::new(
+            vec![
+                ActionPoint::new("a", 0.0, vec![0.0, 0.0]),
+                ActionPoint::new("b", 1.0, vec![1.0, 0.0]),
+                ActionPoint::new("c", 2.0, vec![0.0, 1.0]),
+                ActionPoint::new("d", 3.0, vec![1.0, 1.0]),
+            ],
+            Metric::Euclidean,
+        );
+        let vr = VRComplex::build_filtration(&pc, 2);
+        let bm = BoundaryMatrix::from_vr_complex(&vr);
+        assert!(bm.verify_boundary_squared_zero());
+    }
+
+    #[test]
+    fn test_boundary_vertex_is_zero_column() {
+        let pc = PointCloud::new(
+            vec![
+                ActionPoint::new("a", 0.0, vec![0.0]),
+                ActionPoint::new("b", 1.0, vec![1.0]),
+            ],
+            Metric::Euclidean,
+        );
+        let vr = VRComplex::build_filtration(&pc, 1);
+        let bm = BoundaryMatrix::from_vr_complex(&vr);
+        // First two columns (vertices) should be zero
+        assert!(bm.matrix[0].iter().all(|&v| v == 0));
+        assert!(bm.matrix[1].iter().all(|&v| v == 0));
+    }
+
+    #[test]
+    fn test_boundary_edge_has_two_vertices() {
+        let pc = PointCloud::new(
+            vec![
+                ActionPoint::new("a", 0.0, vec![0.0]),
+                ActionPoint::new("b", 1.0, vec![1.0]),
+            ],
+            Metric::Euclidean,
+        );
+        let vr = VRComplex::build_filtration(&pc, 1);
+        let bm = BoundaryMatrix::from_vr_complex(&vr);
+        // Edge column should have exactly two 1s
+        let edge_col = &bm.matrix[2]; // third simplex is the edge
+        let ones = edge_col.iter().filter(|&&v| v != 0).count();
+        assert_eq!(ones, 2);
     }
 }

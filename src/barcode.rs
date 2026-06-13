@@ -1,192 +1,155 @@
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use crate::boundary::BoundaryMatrix;
-use crate::error::PersistenceError;
-use crate::vietoris_rips::VietorisRipsComplex;
+use serde::{Deserialize, Serialize};
 
-fn serialize_death<S: Serializer>(death: &f64, s: S) -> Result<S::Ok, S::Error> {
-    if death.is_infinite() {
-        s.serialize_str("inf")
-    } else {
-        s.serialize_f64(*death)
-    }
-}
-
-fn deserialize_death<'de, D: Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
-    use serde::de;
-    struct DeathVisitor;
-    impl<'de> de::Visitor<'de> for DeathVisitor {
-        type Value = f64;
-        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { f.write_str("f64 or \"inf\"") }
-        fn visit_f64<E: de::Error>(self, v: f64) -> Result<f64, E> { Ok(v) }
-        fn visit_str<E: de::Error>(self, v: &str) -> Result<f64, E> {
-            if v == "inf" { Ok(f64::INFINITY) } else { Err(E::custom("expected \"inf\"")) }
-        }
-    }
-    d.deserialize_any(DeathVisitor)
-}
-
-/// A single bar in a persistence barcode.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PersistencePair {
-    pub birth: f64,
-    #[serde(serialize_with = "serialize_death", deserialize_with = "deserialize_death")]
-    pub death: f64,
-    pub dimension: usize,
-}
-
-impl PersistencePair {
-    pub fn persistence(&self) -> f64 {
-        self.death - self.birth
-    }
-}
-
-/// The full persistence barcode for all dimensions.
+/// A persistence barcode for a single homology dimension.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Barcode {
-    pub pairs: Vec<PersistencePair>,
-    /// Betti curve sampled at each unique filtration value:
-    /// (epsilon, [β₀, β₁, β₂, …])
-    pub betti_curve: Vec<(f64, Vec<usize>)>,
+    /// Homology dimension (0 = connected components, 1 = loops, 2 = voids).
+    pub dimension: usize,
+    /// Each bar is a (birth, death) pair. death = ∞ means the feature persists.
+    pub bars: Vec<(f64, f64)>,
 }
 
 impl Barcode {
-    /// Compute the barcode from a Vietoris-Rips complex.
-    pub fn compute(vr: &VietorisRipsComplex) -> Result<Self, PersistenceError> {
-        let mut bm = BoundaryMatrix::build(vr)?;
-        let low_map = bm.reduce();
-
-        let n = vr.n_simplices();
-        let mut pairs = Vec::new();
-
-        for (&row, &col) in &low_map {
-            let birth_dim = vr.simplex_dimension(row);
-            // birth simplex is `row`, death simplex is `col`
-            let birth_eps = vr.filtration_values[row];
-            let death_eps = vr.filtration_values[col];
-            pairs.push(PersistencePair {
-                birth: birth_eps,
-                death: death_eps,
-                dimension: birth_dim,
-            });
-        }
-
-        // Remove dead code: unpaired columns logic was unused
-
-        // Find unpaired birth simplices: those that never appear as `low(j)` for any j
-        let mut is_low_of_some_col = vec![false; n];
-        for &row in low_map.keys() {
-            is_low_of_some_col[row] = true;
-        }
-
-        for (i, is_low) in is_low_of_some_col.iter().enumerate() {
-            if vr.simplex_dimension(i) == 0 && !is_low {
-                // Vertex that never got paired — persists to infinity
-                pairs.push(PersistencePair {
-                    birth: vr.filtration_values[i],
-                    death: f64::INFINITY,
-                    dimension: 0,
-                });
-            }
-        }
-
-        // Sort by (dimension, birth)
-        pairs.sort_by(|a, b| {
-            a.dimension
-                .cmp(&b.dimension)
-                .then_with(|| a.birth.partial_cmp(&b.birth).unwrap_or(std::cmp::Ordering::Equal))
-        });
-
-        // Compute Betti curve
-        let max_dim = vr.max_dimension;
-        let mut thresholds = vr.filtration_values.to_vec();
-        thresholds.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        thresholds.dedup_by(|a, b| (*a - *b).abs() < 1e-12);
-
-        let betti_curve = compute_betti_curve(&pairs, &thresholds, max_dim);
-
-        Ok(Self { pairs, betti_curve })
+    /// Number of bars.
+    pub fn num_bars(&self) -> usize {
+        self.bars.len()
     }
 
-    /// Pairs filtered by dimension.
-    pub fn pairs_of_dimension(&self, dim: usize) -> Vec<&PersistencePair> {
-        self.pairs.iter().filter(|p| p.dimension == dim).collect()
+    /// Number of bars alive at a given epsilon value.
+    pub fn betti_at(&self, eps: f64) -> usize {
+        self.bars.iter()
+            .filter(|(birth, death)| *birth <= eps + 1e-12 && (death.is_infinite() || *death > eps))
+            .count()
     }
 
-    /// Maximum persistence value among finite pairs.
+    /// Compute the Betti curve: Betti number at each epsilon threshold.
+    pub fn betti_curve(&self, eps_values: &[f64]) -> Vec<usize> {
+        eps_values.iter().map(|&eps| self.betti_at(eps)).collect()
+    }
+
+    /// Mean persistence (average bar length) for finite bars.
+    pub fn mean_persistence(&self) -> f64 {
+        let finite_bars: Vec<_> = self.bars.iter().filter(|(_, d)| d.is_finite()).collect();
+        if finite_bars.is_empty() {
+            return 0.0;
+        }
+        finite_bars.iter().map(|(b, d)| d - b).sum::<f64>() / finite_bars.len() as f64
+    }
+
+    /// Maximum bar length among finite bars.
     pub fn max_persistence(&self) -> f64 {
-        self.pairs
-            .iter()
-            .filter(|p| p.death.is_finite())
-            .map(|p| p.persistence())
-            .fold(0.0_f64, f64::max)
+        self.bars.iter()
+            .filter(|(_, d)| d.is_finite())
+            .map(|(b, d)| d - b)
+            .fold(0.0f64, f64::max)
     }
 
-    /// Persistence entropy: Shannon entropy of normalized persistence values.
-    pub fn persistence_entropy(&self) -> f64 {
-        let persistences: Vec<f64> = self
-            .pairs
-            .iter()
-            .filter(|p| p.death.is_finite() && p.persistence() > 1e-12)
-            .map(|p| p.persistence())
-            .collect();
-        if persistences.is_empty() {
-            return 0.0;
-        }
-        let total: f64 = persistences.iter().sum();
-        if total < 1e-12 {
-            return 0.0;
-        }
-        persistences
-            .iter()
-            .map(|&p| {
-                let q = p / total;
-                if q > 1e-12 {
-                    -q * q.ln()
-                } else {
-                    0.0
-                }
-            })
+    /// Total persistence: sum of all finite bar lengths.
+    pub fn total_persistence(&self) -> f64 {
+        self.bars.iter()
+            .filter(|(_, d)| d.is_finite())
+            .map(|(b, d)| d - b)
             .sum()
-    }
-
-    /// Betti numbers at the given epsilon value.
-    pub fn betti_numbers_at(&self, eps: f64) -> Vec<usize> {
-        if self.betti_curve.is_empty() {
-            return vec![];
-        }
-        // Find the last entry with epsilon <= eps
-        let mut result = vec![0usize; self.betti_curve[0].1.len()];
-        for &(e, ref bettis) in &self.betti_curve {
-            if e > eps {
-                break;
-            }
-            result = bettis.clone();
-        }
-        result
     }
 }
 
-fn compute_betti_curve(
-    pairs: &[PersistencePair],
-    thresholds: &[f64],
-    max_dim: usize,
-) -> Vec<(f64, Vec<usize>)> {
-    let n_dims = max_dim + 1;
-    let mut curve = Vec::with_capacity(thresholds.len());
+/// A collection of barcodes across all homology dimensions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BarcodeCollection {
+    pub barcodes: Vec<Barcode>,
+}
 
-    for &eps in thresholds {
-        let mut bettis = vec![0usize; n_dims];
-        for pair in pairs {
-            if pair.dimension < n_dims {
-                let alive = pair.birth <= eps + 1e-12
-                    && (pair.death > eps - 1e-12 || !pair.death.is_finite());
-                if alive {
-                    bettis[pair.dimension] += 1;
-                }
-            }
-        }
-        curve.push((eps, bettis));
+impl BarcodeCollection {
+    pub fn new(barcodes: Vec<Barcode>) -> Self {
+        Self { barcodes }
     }
 
-    curve
+    /// Get the barcode for a specific dimension.
+    pub fn dimension(&self, dim: usize) -> Option<&Barcode> {
+        self.barcodes.iter().find(|b| b.dimension == dim)
+    }
+
+    /// Compute Betti numbers at a given epsilon.
+    pub fn betti_numbers(&self, eps: f64) -> Vec<usize> {
+        self.barcodes.iter().map(|b| b.betti_at(eps)).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_single_point_h0_infinite() {
+        let barcode = Barcode {
+            dimension: 0,
+            bars: vec![(0.0, f64::INFINITY)],
+        };
+        assert_eq!(barcode.num_bars(), 1);
+        assert_eq!(barcode.betti_at(0.0), 1);
+        assert_eq!(barcode.betti_at(100.0), 1);
+    }
+
+    #[test]
+    fn test_two_points_merge() {
+        // Two points at distance 2.0: H₀ bars [0,∞) and [0,2)
+        let barcode = Barcode {
+            dimension: 0,
+            bars: vec![(0.0, f64::INFINITY), (0.0, 2.0)],
+        };
+        assert_eq!(barcode.betti_at(0.0), 2); // two components at ε=0
+        assert_eq!(barcode.betti_at(1.0), 2); // still two
+        assert_eq!(barcode.betti_at(2.0), 1); // merged
+        assert_eq!(barcode.betti_at(10.0), 1);
+    }
+
+    #[test]
+    fn test_betti_curve() {
+        let barcode = Barcode {
+            dimension: 0,
+            bars: vec![(0.0, f64::INFINITY), (0.0, 3.0)],
+        };
+        let curve = barcode.betti_curve(&[0.0, 1.0, 2.0, 3.0, 4.0, 5.0]);
+        assert_eq!(curve, vec![2, 2, 2, 1, 1, 1]);
+    }
+
+    #[test]
+    fn test_mean_persistence() {
+        let barcode = Barcode {
+            dimension: 0,
+            bars: vec![(0.0, 2.0), (0.0, 4.0)],
+        };
+        let mean = barcode.mean_persistence();
+        assert!((mean - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_max_persistence() {
+        let barcode = Barcode {
+            dimension: 1,
+            bars: vec![(1.0, 3.0), (2.0, 5.0), (0.5, 0.7)],
+        };
+        assert!((barcode.max_persistence() - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_total_persistence() {
+        let barcode = Barcode {
+            dimension: 0,
+            bars: vec![(0.0, 1.0), (0.0, 2.0), (0.0, f64::INFINITY)],
+        };
+        assert!((barcode.total_persistence() - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_barcode_collection_betti_numbers() {
+        let collection = BarcodeCollection::new(vec![
+            Barcode { dimension: 0, bars: vec![(0.0, f64::INFINITY), (0.0, 2.0)] },
+            Barcode { dimension: 1, bars: vec![(1.5, 3.0)] },
+        ]);
+        let betti = collection.betti_numbers(1.0);
+        assert_eq!(betti, vec![2, 0]); // 2 components, 0 loops
+        let betti = collection.betti_numbers(2.0);
+        assert_eq!(betti, vec![1, 1]); // 1 component, 1 loop
+    }
 }
